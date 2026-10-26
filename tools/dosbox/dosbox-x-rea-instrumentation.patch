@@ -1,0 +1,166 @@
+diff --git a/src/debug/debug.cpp b/src/debug/debug.cpp
+index 152ad8b..a4df076 100644
+--- a/src/debug/debug.cpp
++++ b/src/debug/debug.cpp
+@@ -5257,6 +5257,15 @@ static bool hidedebugger=false;
+ void DEBUG_Enable_Handler(bool pressed) {
+ 	if (!pressed || control->opt_display2)
+ 		return;
++	{   // REA instrumentation: emulated time at each debugger entry (breakpoints), when REA_LOG_BREAK names a file
++		static FILE* rf = NULL; static bool checked = false;
++		if (!checked) { checked = true; if (const char* p = getenv("REA_LOG_BREAK")) rf = fopen(p, "w"); }
++		if (rf) {  // CS:IP, emulated ms, PIT channel 0 time base and period (ms)
++			extern void REA_Pit0(double& start, double& delay);
++			double st, dl; REA_Pit0(st, dl);
++			fprintf(rf, "%04X:%04X %.9f pit0 %.9f %.12f\n", (unsigned)SegValue(cs), (unsigned)reg_ip, (double)PIC_FullIndex(), st, dl); fflush(rf);
++		}
++	}
+ 
+     if (hidedebugger) {
+         hidedebugger=false;
+@@ -6561,6 +6570,22 @@ void DEBUG_HeavyWriteLogInstruction(void) {
+ }
+ 
+ bool DEBUG_HeavyIsBreakpoint(void) {
++	{   // REA instrumentation: CS:IP and emulated ms of each instruction for REA_LOG_INSN_MS ms after the program
++		// entry REA_LOG_INSN_AT (SSSS:OOOO) is first reached, into the file REA_LOG_INSN
++		static FILE* rf = NULL; static bool checked = false; static unsigned at_cs = 0, at_ip = 0;
++		static double until = -1, window = 0;
++		if (!checked) {
++			checked = true;
++			const char* p = getenv("REA_LOG_INSN"); const char* a = getenv("REA_LOG_INSN_AT"); const char* w = getenv("REA_LOG_INSN_MS");
++			if (p && a && w && sscanf(a, "%x:%x", &at_cs, &at_ip) == 2) { rf = fopen(p, "w"); window = atof(w); }
++		}
++		if (rf) {
++			const double now = (double)PIC_FullIndex();
++			if (until < 0 && SegValue(cs) == at_cs && reg_ip == at_ip) until = now + window;
++			if (until >= 0 && now <= until) fprintf(rf, "%04X:%04X %.6f\n", (unsigned)SegValue(cs), (unsigned)reg_ip, now);
++			else if (until >= 0) { fclose(rf); rf = NULL; }
++		}
++	}
+ #if defined(C_DOSBOX_AGENT)
+ 	const bool agent_trace_was_active = agent_trace_active;
+     if (agent_trace_active) {
+diff --git a/src/dos/dos.cpp b/src/dos/dos.cpp
+index 2d89329..3fd59ab 100644
+--- a/src/dos/dos.cpp
++++ b/src/dos/dos.cpp
+@@ -1664,6 +1664,16 @@ static Bitu DOS_21Handler(void) {
+                 time/=60;
+                 reg_ch=(uint8_t)((Bitu)time % 24); // hours
+             }
++            // REA lockstep instrumentation (no behaviour change): record each clock reading as an input
++            // for replay in the recompiled port. Line: caller CS:IP (from the INT frame), CX, DX.
++            if (const char* rea_log = getenv("REA_LOG_DOSTIME")) {
++                static FILE* rea_f = fopen(rea_log, "w");
++                if (rea_f) {
++                    const PhysPt frame = SegPhys(ss) + reg_sp;
++                    fprintf(rea_f, "%04X:%04X %04X %04X\n", mem_readw(frame + 2), mem_readw(frame), reg_cx, reg_dx);
++                    fflush(rea_f);
++                }
++            }
+ 
+             //Simulate DOS overhead for timing-sensitive games
+             //Robomaze 2
+diff --git a/src/dosbox.cpp b/src/dosbox.cpp
+index 0a86b71..510f7bd 100644
+--- a/src/dosbox.cpp
++++ b/src/dosbox.cpp
+@@ -493,6 +493,12 @@ static Bitu Normal_Loop(void) {
+                     last_callback = (unsigned int)ret;
+ 
+                     dosbox_allow_nonrecursive_page_fault = false;
++                    {   // REA instrumentation: callback number, AX and emulated ms, when REA_LOG_CB names a file
++                        static FILE* rf = NULL; static bool checked = false;
++                        if (!checked) { checked = true; if (const char* p = getenv("REA_LOG_CB")) rf = fopen(p, "w"); }
++                        if (rf) { fprintf(rf, "%u %04X %.6f %04X:%04X\n", (unsigned)ret, (unsigned)reg_ax, (double)PIC_FullIndex(),
++                            (unsigned)mem_readw(SegPhys(ss) + ((reg_sp + 2) & 0xFFFF)), (unsigned)mem_readw(SegPhys(ss) + reg_sp)); fflush(rf); }
++                    }
+                     Bitu blah = (*CallBack_Handlers[ret])();
+                     dosbox_allow_nonrecursive_page_fault = saved_allow;
+ 
+diff --git a/src/hardware/keyboard.cpp b/src/hardware/keyboard.cpp
+index 423e8d2..ed7035a 100644
+--- a/src/hardware/keyboard.cpp
++++ b/src/hardware/keyboard.cpp
+@@ -737,7 +737,9 @@ static Bitu read_p61(Bitu, Bitu) {
+     return dbg;
+ }
+ 
++void REA_LogSpeakerIO(Bitu port, Bitu val);
+ static void write_p61(Bitu, Bitu val, Bitu) {
++    REA_LogSpeakerIO(0x61, val);
+     uint8_t diff = port_61_data ^ (uint8_t)val;
+     if (diff & 0x1) TIMER_SetGate2(val & 0x1);
+     if ((diff & 0x3) && !IS_PC98_ARCH) {
+diff --git a/src/hardware/timer.cpp b/src/hardware/timer.cpp
+index ac62317..53c2037 100644
+--- a/src/hardware/timer.cpp
++++ b/src/hardware/timer.cpp
+@@ -561,7 +561,20 @@ bool TIMER2_ClockGateEnabled() {
+ //   immediately, and the IRQ wrote the count in the middle, then returned for the code to
+ //   write the second byte. This race condition confused the 8254. Fixing the code not to do
+ //   that fixes the demo crash.
++// REA lockstep instrumentation (no behaviour change): log speaker-related port writes (PIT channel 2
++// data/mode, port 61h) with the emulated time in ms, when REA_LOG_SPEAKER names a file.
++// REA instrumentation: PIT channel 0 time base and period (ms), for the phase of the timer tick at a debugger stop.
++void REA_Pit0(double& start, double& delay) { start = (double)pit[0].start; delay = (double)pit[0].delay; }
++
++void REA_LogSpeakerIO(Bitu port, Bitu val) {
++    static FILE* f = nullptr;
++    static bool checked = false;
++    if (!checked) { checked = true; if (const char* p = getenv("REA_LOG_SPEAKER")) f = fopen(p, "w"); }
++    if (f) { fprintf(f, "%02X %02X %.3f\n", (unsigned)port, (unsigned)val, (double)PIC_FullIndex()); fflush(f); }
++}
++
+ static void write_latch(Bitu port,Bitu val,Bitu /*iolen*/) {
++    if (port == 0x42) REA_LogSpeakerIO(port, val);
+ //LOG(LOG_PIT,LOG_ERROR)("port %X write:%X state:%X",port,val,pit[port-0x40].write_state);
+ 
+ 	// HACK: Port translation for this code PC-98 mode.
+@@ -809,6 +822,7 @@ static Bitu read_latch(Bitu port,Bitu /*iolen*/) {
+ }
+ 
+ static void write_p43(Bitu /*port*/,Bitu val,Bitu /*iolen*/) {
++    if (((val >> 6) & 3) == 2) REA_LogSpeakerIO(0x43, val);
+ //LOG(LOG_PIT,LOG_ERROR)("port 43 %X",val);
+ 	Bitu latch=(val >> 6) & 0x03;
+ 	switch (latch) {
+diff --git a/src/hardware/vga_draw.cpp b/src/hardware/vga_draw.cpp
+index dd7ed8b..e874235 100644
+--- a/src/hardware/vga_draw.cpp
++++ b/src/hardware/vga_draw.cpp
+@@ -6118,6 +6118,14 @@ extern bool DEBUG_HaltOnRetrace;
+ Bitu DEBUG_EnableDebugger(void);
+ #endif
+ 
++// REA instrumentation: VGA frame timing (frame starts, retrace/blanking window) with the emulated time in ms,
++// when REA_LOG_VGA names a file.
++static FILE* REA_VgaLog(void) {
++    static FILE* f = NULL; static bool checked = false;
++    if (!checked) { checked = true; if (const char* p = getenv("REA_LOG_VGA")) f = fopen(p, "w"); }
++    return f;
++}
++
+ static void VGA_VerticalTimer(Bitu /*val*/) {
+ 	double current_time = PIC_GetCurrentEventTime();
+ 
+@@ -6171,6 +6179,7 @@ static void VGA_VerticalTimer(Bitu /*val*/) {
+ 
+ 	vga.draw.hsync_events = 0;
+ 	vga.draw.delay.framestart = current_time; /* used by port 3DAh, for example */
++	if (FILE* rf = REA_VgaLog()) { fprintf(rf, "F %.9f\n", (double)current_time); fflush(rf); }
+ 	vga_page_flip_occurred = false;
+ 	vga.draw.has_split = false;
+ 	vga_3da_polled = false;
+@@ -8473,6 +8482,10 @@ void VGA_SetupDrawing(Bitu /*val*/) {
+ 		}
+ 	}
+ 	vga.draw.delay.singleline_delay = (float)vga.draw.delay.htotal;
++	if (FILE* rf = REA_VgaLog()) fprintf(rf, "D %.9f vtotal %.12f htotal %.12f hblk %.12f %.12f vr %.12f %.12f vdend %.12f base %.9f fps %.9f\n",
++		(double)PIC_FullIndex(), (double)vga.draw.delay.vtotal, (double)vga.draw.delay.htotal, (double)vga.draw.delay.hblkstart,
++		(double)vga.draw.delay.hblkend, (double)vga.draw.delay.vrstart, (double)vga.draw.delay.vrend, (double)vga.draw.delay.vdend,
++		(double)vga_mode_time_base, (double)vga_fps), fflush(rf);
+ 	vga.draw.must_complete_frame = true;
+ 
+ 	if (machine == MCH_HERC && hercCard == HERC_InColor) {

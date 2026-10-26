@@ -1,0 +1,26 @@
+# Original game data and anything derived from it never enters git (see NOTICE.md).
+/original/
+/work/
+/build/
+/build-*/
+__pycache__/
+
+# Generated from BALLOONC.EXE at build time (recompiled program, its image, the reference boot environment)
+/recomp/gen/
+/recomp/build/
+/recomp/build-rc/
+/recomp/build.log
+# Run folders hold copies of the game files; screenshots show game graphics
+/recomp/run/
+/recomp/run_*/
+/recomp/ls_port/
+/recomp/*.png
+# Generated main-body regions and module procedures (tools/gen_regions.py, tools/gen_modules.py)
+/src/game/region_*.cpp
+/src/game/module_*.cpp
+# Scratch logs and traces of local runs
+*.log
+/recomp/trace.txt
+/recomp/ints.txt
+/recomp/missing.txt
+/cmp_s2.txt
