@@ -1,5 +1,6 @@
 #include "ega.h"
 
+#include <array>
 #include <cstring>
 
 namespace rc {
@@ -140,13 +141,22 @@ void Ega::render_indices(std::vector<uint8_t>& out, int& w, int& h) const {
     if (!graphics) return;
     const unsigned stride = crtc[0x13] * 2u ? crtc[0x13] * 2u : 80u;
     const unsigned start = start_address();
+    // Eight pixels per plane byte: spread[b] holds bit 7..0 of b as bytes 0..7 (pixel order, little-endian).
+    static const auto spread = [] {
+        std::array<uint64_t, 256> t{};
+        for (int b = 0; b < 256; ++b)
+            for (int i = 0; i < 8; ++i) t[b] |= uint64_t((b >> (7 - i)) & 1) << (8 * i);
+        return t;
+    }();
+    const uint64_t mask = (attr[0x12] & 0x0Fu) * 0x0101010101010101ull;
     for (int y = 0; y < h; ++y) {
-        for (int x = 0; x < w; ++x) {
-            const unsigned off = (start + y * stride + (x >> 3)) & 0xFFFF;
-            const int bit = 7 - (x & 7);
-            uint8_t v = 0;
-            for (int p = 0; p < 4; ++p) v |= uint8_t(((planes[p][off] >> bit) & 1) << p);
-            out[size_t(y) * w + x] = v & attr[0x12];
+        uint8_t* row = out.data() + size_t(y) * w;
+        for (int xb = 0; xb < w / 8; ++xb) {
+            const unsigned off = (start + y * stride + xb) & 0xFFFF;
+            const uint64_t v = spread[planes[0][off]] | spread[planes[1][off]] << 1 | spread[planes[2][off]] << 2 |
+                               spread[planes[3][off]] << 3;
+            const uint64_t px = v & mask;
+            std::memcpy(row + xb * 8, &px, 8);
         }
     }
 }

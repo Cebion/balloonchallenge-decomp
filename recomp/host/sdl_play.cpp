@@ -17,6 +17,7 @@
 #include <deque>
 #include <mutex>
 #include <cstdlib>
+#include <cstring>
 #include <string>
 #include <vector>
 
@@ -27,11 +28,14 @@ namespace {
 
 // Speaker events (emulated ms, frequency Hz or 0) played at their emulated times, kLatencyMs behind the
 // machine, so tones of a few ms (the game steps pitch every 2-20 ms) keep their exact order and length.
+// The audio clock follows the machine clock (rate correction over kFollowMs), so a machine running a little
+// slower than real time (slow handhelds) plays its tones slower too instead of running dry and resyncing.
 struct Tone { double ms; uint32_t freq; };
 std::mutex g_tone_mutex;
 std::deque<Tone> g_tones;
 std::atomic<double> g_machine_ms{0};
 constexpr double kLatencyMs = 60;
+constexpr double kFollowMs = 250;
 
 void audio_callback(void*, Uint8* stream, int len) {
     static double phase = 0, audio_ms = -1;
@@ -39,10 +43,12 @@ void audio_callback(void*, Uint8* stream, int len) {
     int16_t* out = reinterpret_cast<int16_t*>(stream);
     const double target = g_machine_ms.load() - kLatencyMs;
     if (audio_ms < 0 || audio_ms < target - 4 * kLatencyMs || audio_ms > target + kLatencyMs) audio_ms = target;  // resync
+    double rate = 1.0 + (target - audio_ms) / kFollowMs;
+    rate = rate < 0.5 ? 0.5 : (rate > 1.5 ? 1.5 : rate);
     std::lock_guard<std::mutex> lock(g_tone_mutex);
     for (int i = 0; i < len / 2; ++i) {
         while (!g_tones.empty() && g_tones.front().ms <= audio_ms) { freq = g_tones.front().freq; g_tones.pop_front(); }
-        audio_ms += 1000.0 / 44100.0;
+        audio_ms += rate * 1000.0 / 44100.0;
         if (freq == 0 || freq > 20000) { out[i] = 0; continue; }
         phase += double(freq) / 44100.0;
         phase -= double(int(phase));
@@ -177,9 +183,9 @@ int main(int argc, char** argv) {
     }
     uint8_t* ram = rc::machine_memory_rw(m);
 
-    std::vector<uint8_t> idx;
+    std::vector<uint8_t> idx, prev_idx;
     std::vector<uint32_t> rgb;
-    uint32_t pal[16];
+    uint32_t pal[16], prev_pal[16] = {};
     Uint64 last = SDL_GetPerformanceCounter();
     bool running = true;
     while (running) {
@@ -255,14 +261,19 @@ int main(int argc, char** argv) {
         }
         int w, h;
         rc::machine_render(m, idx, w, h, pal);
+        const bool changed = !tex || w != tex_w || h != tex_h || idx != prev_idx || std::memcmp(pal, prev_pal, sizeof pal) != 0;
         if (w != tex_w || h != tex_h) {
             if (tex) SDL_DestroyTexture(tex);
             tex = SDL_CreateTexture(ren, SDL_PIXELFORMAT_ARGB8888, SDL_TEXTUREACCESS_STREAMING, w, h);
             tex_w = w; tex_h = h;
         }
-        rgb.resize(idx.size());
-        for (size_t i = 0; i < idx.size(); ++i) rgb[i] = 0xFF000000u | pal[idx[i] & 15];
-        SDL_UpdateTexture(tex, nullptr, rgb.data(), w * 4);
+        if (changed) {  // unchanged screens keep the uploaded texture (conversion and upload are slow on handhelds)
+            rgb.resize(idx.size());
+            for (size_t i = 0; i < idx.size(); ++i) rgb[i] = 0xFF000000u | pal[idx[i] & 15];
+            SDL_UpdateTexture(tex, nullptr, rgb.data(), w * 4);
+            prev_idx.swap(idx);
+            std::memcpy(prev_pal, pal, sizeof pal);
+        }
         SDL_RenderClear(ren);
         SDL_RenderCopy(ren, tex, nullptr, nullptr);
         SDL_RenderPresent(ren);

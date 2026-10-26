@@ -35,6 +35,10 @@ public:
     Ega ega;
     MachineOptions opt;
     std::unordered_map<uint32_t, BlockFn> blocks;
+    // Direct-mapped cache in front of `blocks` (filled once at init, never changed): CS:IP -> block.
+    struct BlockCacheEntry { uint32_t key; BlockFn fn; };
+    static constexpr size_t kBlockCacheSize = 1 << 14;
+    std::vector<BlockCacheEntry> block_cache = std::vector<BlockCacheEntry>(kBlockCacheSize, {0, nullptr});
     RunState state = RunState::Running;
     std::string message;
     // PIC
@@ -178,27 +182,33 @@ public:
     bool step() {
         update_timers();
         service_irqs();
-        auto it = blocks.find((uint32_t(c.cs) << 16) | c.ip);
-        if (it == blocks.end()) {
-            char buf[96];
-            std::snprintf(buf, sizeof buf, "no translated code for %04X:%04X", c.cs, c.ip);
-            message = buf;
-            if (missing) { std::fprintf(missing, "%04X:%04X\n", c.cs, c.ip); std::fflush(missing); }
-            state = RunState::Missing;
-            return false;
+        const uint32_t addr = (uint32_t(c.cs) << 16) | c.ip;
+        BlockCacheEntry& cached = block_cache[(addr ^ (addr >> 14)) & (kBlockCacheSize - 1)];
+        if (cached.key != addr || !cached.fn) {
+            auto found = blocks.find(addr);
+            if (found == blocks.end()) {
+                char buf[96];
+                std::snprintf(buf, sizeof buf, "no translated code for %04X:%04X", c.cs, c.ip);
+                message = buf;
+                if (missing) { std::fprintf(missing, "%04X:%04X\n", c.cs, c.ip); std::fflush(missing); }
+                state = RunState::Missing;
+                return false;
+            }
+            cached = {addr, found->second};
         }
-        if (!at_block(it->first)) return false;
+        const BlockFn fn = cached.fn;  // the slot may be reused by nested runs below
+        if (!at_block(addr)) return false;
         if (block_trace) {  // RC_TRACE_BLOCKS: block start and the clock as DOSBox-X counts the instruction, for
             // RC_TRACE_MS ms from the first time block RC_TRACE_AT (SSSS:OOOO, default: the start) runs
             const double ms = double(c.icount + 1) / ipms();
-            if (block_trace_from < 0 && (!block_trace_at || block_trace_at == it->first)) block_trace_from = ms;
+            if (block_trace_from < 0 && (!block_trace_at || block_trace_at == addr)) block_trace_from = ms;
             if (block_trace_from >= 0 && ms >= block_trace_from && ms <= block_trace_from + block_trace_ms)
                 std::fprintf(block_trace, "%04X:%04X %.6f\n", c.cs, c.ip, ms);
         }
         if (!natives.empty() && opt.native != MachineOptions::Native::Off && !natives_suspended) {
-            const auto n = natives.find(it->first);
+            const auto n = natives.find(addr);
             if (n != natives.end()) {
-                cur_block = it->first;
+                cur_block = addr;
                 ++in_native;
                 if (opt.native == MachineOptions::Native::Verify && nesting == 0) verify_native(n->second);
                 else { n->second.fn(c); if (!verify_child) ++nested_runs[n->second.name]; }
@@ -206,10 +216,10 @@ public:
                 return true;
             }
         }
-        if (profiling) ++profile[it->first];
-        cur_block = it->first;
+        if (profiling) ++profile[addr];
+        cur_block = addr;
         if (!smc_unhandled.empty()) {
-            const uint32_t start = (uint32_t(c.cs) << 4) + c.ip, len = block_bytes[it->first];
+            const uint32_t start = (uint32_t(c.cs) << 4) + c.ip, len = block_bytes[addr];
             for (uint32_t a : smc_unhandled)
                 if (a >= start && a < start + len) {
                     char buf[120];
@@ -219,7 +229,7 @@ public:
                     return false;
                 }
         }
-        it->second(c);
+        fn(c);
         return true;
     }
 
