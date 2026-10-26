@@ -13,7 +13,9 @@
 #include <SDL.h>
 
 #include <atomic>
+#include <chrono>
 #include <cstdio>
+#include <ctime>
 #include <deque>
 #include <mutex>
 #include <cstdlib>
@@ -146,6 +148,15 @@ int main(int argc, char** argv) {
     }
     if (o.data_dir.empty()) { std::fprintf(stderr, "usage: rc_play --data DIR [--scale N] [--speed INSNS_PER_MS]\n"); return 2; }
     if (record.empty()) {  // recordings keep their own test state (--poke); normal play checks the player's files
+        // The BIOS clock starts at the local time of day, as on a PC (the game seeds its boards with RANDOMIZE
+        // TIMER); recordings keep the reference capture's clock so their replays match.
+        const auto now = std::chrono::system_clock::now();
+        const std::time_t t = std::chrono::system_clock::to_time_t(now);
+        std::tm lt{};
+        localtime_r(&t, &lt);
+        const double frac = std::chrono::duration<double>(now - std::chrono::system_clock::from_time_t(t)).count();
+        const double secs = lt.tm_hour * 3600.0 + lt.tm_min * 60.0 + lt.tm_sec + frac;
+        o.start_ticks = uint32_t(secs * (1193182.0 / 65536.0));
         const host::GameFiles gf = host::check_game_files(o.data_dir, o);
         std::fprintf(stderr, "%s\n", gf.message.c_str());
         if (gf.edition == host::Edition::Unusable) {
